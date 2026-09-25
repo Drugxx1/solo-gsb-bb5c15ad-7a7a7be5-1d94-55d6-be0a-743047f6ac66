@@ -8,6 +8,8 @@
 
 - **无负环（可行）**：所有公差能同时满足，`/check` 返回以基准点为零的各点整数坐标；
   `/ranges` 进一步返回每个测点在全部约束同时成立时可分别达到的**最小/最大整数坐标紧界**；
+  `/redundancy` 逐条判定每条尺寸约束是否已被**其余约束及基准点钉零关系蕴含**（删去该约束
+  上下界两条边后，其余条件对 `end−start` 推出的最紧区间是否完全落入原区间），返回推导界与冗余标记；
   `/reconcile` 在提交各测点实测**读数**后，求让全部测点同时满足
   `|校正坐标 − 读数| ≤ e` 的**最小非负整数 e**，并返回达到该 e 的同一组校正坐标与逐点校正量；
 - **有负环（不可行）**：沿负环累加得到 `0 ≤ 负数` 的矛盾，返回构成该矛盾
@@ -28,6 +30,7 @@ docker compose up --build -d
 | 健康检查 | <http://localhost:8000/healthz> |
 | 可行性校核接口 | `POST http://localhost:8000/api/v1/chains/check` |
 | 测点坐标紧界接口 | `POST http://localhost:8000/api/v1/chains/ranges` |
+| 冗余约束识别接口 | `POST http://localhost:8000/api/v1/chains/redundancy` |
 | 读数最小校正接口 | `POST http://localhost:8000/api/v1/chains/reconcile` |
 | Swagger UI（在线试调） | <http://localhost:8000/docs> |
 | OpenAPI Schema | <http://localhost:8000/openapi.json> |
@@ -66,6 +69,11 @@ curl -s -X POST http://localhost:8000/api/v1/chains/ranges \
   -H 'Content-Type: application/json' \
   -d @examples/ranges.json | python -m json.tool
 
+# 可行：逐条识别冗余约束（c3 被 c1+c2 蕴含，推导区间 [15,20] 落入原区间 [14,22]）
+curl -s -X POST http://localhost:8000/api/v1/chains/redundancy \
+  -H 'Content-Type: application/json' \
+  -d @examples/redundancy.json | python -m json.tool
+
 # 可行：给实测读数，求最小统一校正量 e、同一组校正坐标与逐点校正量
 curl -s -X POST http://localhost:8000/api/v1/chains/reconcile \
   -H 'Content-Type: application/json' \
@@ -84,11 +92,11 @@ curl -s -X POST http://localhost:8000/api/v1/chains/check \
 
 ## 请求与响应
 
-`/api/v1/chains/check` 与 `/api/v1/chains/ranges` 的请求体、静态校验规则
-（含下文 422 错误码）完全一致；`/reconcile` 在其基础上**额外要求** `readings`
-字段，其余字段与校验规则沿用。
+`/api/v1/chains/check`、`/api/v1/chains/ranges` 与 `/api/v1/chains/redundancy`
+的请求体、静态校验规则（含下文 422 错误码）完全一致；`/reconcile` 在其基础上
+**额外要求** `readings` 字段，其余字段与校验规则沿用。
 
-### 请求体 `POST /api/v1/chains/check`（`/ranges` 同）
+### 请求体 `POST /api/v1/chains/check`（`/ranges`、`/redundancy` 同）
 
 ```json
 {
@@ -171,6 +179,63 @@ c1/c2 则 B、C 各为 `[0,10]`，但 c3 要求 `C − B = 5`，跨测点约束�
   （B=0⇒C=5 达到最小端；B=5⇒C=10 达到最大端）；
 - 多个基准点互钉为 0 的固定关系、跨测点约束、负权边（反向公差）均已纳入推导，
   界为包含负数的整数闭区间（如 `{"minimum": -12, "maximum": -10}`）。
+
+### `POST /api/v1/chains/redundancy`：冗余约束识别
+
+请求体与 `/check` **完全相同**（同样的字段、同样的静态校验与 422 响应）；
+不可行时返回与 `/check` **完全相同**的 `InfeasibleResponse`（矛盾闭环编号、
+逐边明细、环权）。可行时**按输入顺序**逐条判定：把该约束的上下界两条差分边
+从图中移除，用**其余约束与基准点钉零关系**对 `coord(end) − coord(start)`
+推出最紧下界与上界；只有推导区间**完全落入**原约束区间 `[lower, upper]`
+（端点相等也算落入）才标记 `redundant=true`。**待判约束自身不参与推导**。
+
+请求（`examples/redundancy.json`）：
+
+```json
+{
+  "datum_points": ["A"],
+  "measure_points": ["B", "C"],
+  "constraints": [
+    {"id": "c1", "start": "A", "end": "B", "lower": 10, "upper": 12},
+    {"id": "c2", "start": "B", "end": "C", "lower": 5, "upper": 8},
+    {"id": "c3", "start": "A", "end": "C", "lower": 14, "upper": 22}
+  ]
+}
+```
+
+响应（HTTP 200）：
+
+```json
+{
+  "status": "feasible",
+  "unit": "um",
+  "constraints": [
+    {"id": "c1", "derived_lower": 6, "derived_upper": 17, "redundant": false},
+    {"id": "c2", "derived_lower": 2, "derived_upper": 12, "redundant": false},
+    {"id": "c3", "derived_lower": 15, "derived_upper": 20, "redundant": true}
+  ]
+}
+```
+
+上例中删去 c3 后，c1+c2 蕴含 `C − A ∈ [15, 20]`，完全落入 c3 的原区间
+`[14, 22]`，故 c3 冗余；而删去 c1（或 c2）后其余条件只能推出更宽的区间
+（如 c1 对应 `[6, 17]`），超出原区间，故不冗余。
+
+| 字段 | 说明 |
+| --- | --- |
+| `constraints[].id` | 约束原始编号，严格按请求 `constraints` 的顺序列出 |
+| `constraints[].derived_lower` | 删去该约束后，其余条件对 `end−start` 推出的最紧下界（整数 µm，含端点）；该侧不可达（下无界）时为 `null` |
+| `constraints[].derived_upper` | 同上，最紧上界；上无界时为 `null` |
+| `constraints[].redundant` | 推导区间完全落入原约束区间时为 `true`；任一侧为 `null`（无界）必为 `false` |
+
+推导界语义（重要）：
+
+- 推导界是**最紧**的——存在一组满足其余全部约束（含基准点为 0）的整数坐标，
+  使 `end−start` 恰好取到 `derived_lower` / `derived_upper`；
+- 删除约束后若其两端在差分图中不再连通（如链式结构中的桥接约束），两侧推导界
+  均为 `null`，表示其余条件对该约束的差值毫无限制，自然不可能冗余；
+- 基准点互钉为 0 的 pin 边、跨测点约束、负权边均参与推导；只有**待判约束自身**
+  的两条边被移除，其余同起点/同终点的约束（包括完全相同的重复约束）照常参与。
 
 ### `POST /api/v1/chains/reconcile`：读数最小校正
 
@@ -313,6 +378,16 @@ Pydantic 拦截，同样返回 HTTP 422。
 
 两组极值距离各自给出一组满足全部不等式的全局可行坐标（全部基准点为 0），
 因此上下界均可达到、是紧界；整数边权保证端点为整数微米。复杂度 O(|V|·|E|)。
+
+`/redundancy` 对每条约束各做一次“删边最短路”：删去该约束的
+`start→end`（权 `upper`）与 `end→start`（权 `−lower`）两条边后，
+其余条件（含基准点 pin 边）对 `end−start` 的最紧上界等于删边图
+`start→end` 的最短距离，最紧下界等于 `end→start` 最短距离取负；
+不可达的一侧返回 `null`（无界）。原系统可行则删边子图仍无负环，
+故最短路一定存在（或不可达）；推导区间完全落入原区间时该约束冗余。
+实现先用队列松弛（SPFA）求一次全源最短路：边 `u→v` 权 `w` 若满足
+`d(u,v) < w` 就不可能出现在最短 `u→v` 路径上（“松边”），删边距离
+直接取 `d(u,v)`，只有 `d(u,v) == w` 的少量“紧边”才需在删边图上重算。
 
 `/reconcile` 把每个读数 `r_p` 的容差条件 `|x_p − r_p| ≤ e` 同样写成两条
 差分边：`anchor → p` 权 `r_p + e`、`p → anchor` 权 `e − r_p`，并入原差分图

@@ -1,4 +1,4 @@
-"""差分约束求解：Bellman-Ford 负环检测与坐标紧界推导。
+"""差分约束求解：Bellman-Ford 负环检测、坐标紧界推导与删边最短路冗余判定。
 
 建模
 ----
@@ -28,6 +28,27 @@
 跨测点约束、多个基准点互钉为 0 的 pin 边、负权边均已在图中，故这是
 纳入全部固定关系后的全局紧界；各测点的端点不必由同一组坐标同时达到。
 整数权 ⇒ 最短路距离为整数，紧界本身即整数微米坐标。
+
+冗余判定（``solve_redundancy``）
+--------------------------------
+对每条约束 ``c: coord(end) − coord(start) ∈ [lower, upper]``，在**删去其
+上下界两条差分边**后的图上（其余约束与基准点 pin 边全部保留，待判约束
+本身不参与推导）重新求最短路：
+
+* 推导上界 = 删边图中 ``start → end`` 的最短距离（不可达则上无界，记 None）；
+* 推导下界 = 删边图中 ``end → start`` 的最短距离取负（不可达则下无界）。
+
+最短路即最紧界：距离赋值 ``x_v = d(start, v)``（再整体平移使基准点为 0）
+本身就达到该差值，论证同 ``solve_ranges``。仅当两侧均有界且推导区间
+完全落入原区间 ``[lower, upper]``（``derived_lower ≥ lower`` 且
+``derived_upper ≤ upper``）时，该约束才被其余条件蕴含（冗余）。
+原系统可行 ⇒ 删边子图仍无负环，最短路必存在（或不可达）。
+
+实现先用队列松弛（SPFA）求全源最短距离：边 ``u→v`` 权 ``w`` 若满足
+``d(u,v) < w``（“松边”），则它不可能出现在任何最短 u→v 路径上（最短路径
+可取 simple path，其上该边只能是 u→v 的整段单条边），删边距离就是
+``d(u,v)``；只有 ``d(u,v) == w`` 的“紧边”才需在删边图上重算。通常紧边
+很少（零宽链这类极端情形除外），故远快于每约束两次完整 Bellman–Ford。
 
 读数校正（``solve_reconcile``）
 -------------------------------
@@ -82,6 +103,16 @@ class Edge:
     end: str | None  # 原始约束终点（pin 边为 None）
 
 
+@dataclass(frozen=True)
+class RedundancyItem:
+    """单条约束的冗余判定结果（推导界为 None 表示该侧无界）。"""
+
+    cid: str
+    lower: int | None  # 其余条件对 coord(end)−coord(start) 推出的最紧下界
+    upper: int | None  # 其余条件对 coord(end)−coord(start) 推出的最紧上界
+    redundant: bool
+
+
 @dataclass
 class SolveResult:
     feasible: bool
@@ -93,6 +124,8 @@ class SolveResult:
     ranges: dict[str, tuple[int, int]] | None = None
     # solve_reconcile 可行时：最小非负整数 e（逐点校正量绝对值的最大值）
     max_abs_correction: int | None = None
+    # solve_redundancy 可行时：逐条约束（请求顺序）的推导界与冗余标记
+    redundancy: list[RedundancyItem] | None = None
 
 
 def _err(code: str, message: str, location: list, constraint_id: str | None = None) -> dict:
@@ -388,6 +421,113 @@ def solve_ranges(req: ChainRequest) -> SolveResult:
         # -lower_dist[p] ≤ x_p ≤ upper_dist[p]
         ranges[p] = (-int(lower_dist[p]), int(upper_dist[p]))
     return SolveResult(True, coordinates, [], 0, ranges)
+
+
+def solve_redundancy(req: ChainRequest) -> SolveResult:
+    """逐条判定约束是否已被其余约束与基准点钉零关系蕴含。
+
+    先整体判可行：静态校验失败抛 ValidationError；不可行时返回与 solve
+    相同的矛盾闭环。可行时按请求顺序对每条约束
+    ``c: coord(end) − coord(start) ∈ [lower, upper]``，在删去 c 的上下界
+    两条差分边后的图上（其余约束、datum_pin 边全部保留）求最紧推导区间：
+
+    * 推导上界 = 删边图 start→end 的最短距离（不可达 ⇒ 上无界 ⇒ None）；
+    * 推导下界 = 删边图 end→start 的最短距离取负（不可达 ⇒ 下无界 ⇒ None）。
+
+    仅当两侧均有界且推导区间完全落入 [lower, upper] 时标记 redundant。
+    原图无负环 ⇒ 删边子图（少边）亦无负环，最短路必存在（或不可达）。
+
+    实现上先用队列松弛（SPFA，与 Bellman–Ford 同族的差分图最短路）从每个
+    节点求一次全图最短距离。对边 e: u→v 权 w：若全图 d(u,v) < w，则任何
+    最短 u→v 路径都不会取 e（simple path 上 e 只能作为整段 u→v 单条边出现），
+    删边距离就是 d(u,v)；只有 d(u,v) == w 的“紧边”才需要在删去该约束的
+    图上单独重算。一般只有少量边是紧边，从而把朴素的每约束两次 Bellman–Ford
+    （O(|C|·|V|·|E|)）压缩为全源最短路加少量删边最短路。
+    """
+    validate_request(req)
+
+    anchor = req.datum_points[0]
+    nodes = list(dict.fromkeys([*req.datum_points, *req.measure_points]))
+    edges = _build_edges(req, anchor)
+
+    # 沿用 Bellman–Ford 做可行性判定（与 /check 同一套负环溯源）
+    dist, pred, bad_edge = _bellman_ford(nodes, edges, anchor)
+    if bad_edge is not None:
+        cycle = _extract_cycle(pred, bad_edge, len(nodes))
+        return SolveResult(False, {}, cycle, sum(e.weight for e in cycle))
+
+    # 可行图无负环：全源最短路（含负权，SPFA 必然收敛）。
+    # 每条约束上下界成对出边、基准 pin 边双向，故全图强连通、距离均有限；
+    # 删边后不可达的节点距离在删边重算时才出现。
+    adjacency: dict[str, list[Edge]] = {p: [] for p in nodes}
+    for e in edges:
+        adjacency[e.fr].append(e)
+    full_dist = {p: _spfa(nodes, adjacency, p) for p in nodes}
+
+    items: list[RedundancyItem] = []
+    for c in req.constraints:
+        # 上界：删去待判约束自身后 start→end 的最短路（pin 边 cid=None 保留）
+        if full_dist[c.start][c.end] < c.upper:
+            upper = int(full_dist[c.start][c.end])  # 松边：删不删都一样
+        else:
+            d_red = _spfa(nodes, adjacency, c.start, exclude_cid=c.id)
+            upper = int(d_red[c.end]) if d_red[c.end] != INF else None
+        # 下界：删边图 end→start 最短路取负
+        if full_dist[c.end][c.start] < -c.lower:
+            lower = -int(full_dist[c.end][c.start])
+        else:
+            d_red = _spfa(nodes, adjacency, c.end, exclude_cid=c.id)
+            lower = -int(d_red[c.start]) if d_red[c.start] != INF else None
+        items.append(
+            RedundancyItem(
+                cid=c.id,
+                lower=lower,
+                upper=upper,
+                redundant=(
+                    lower is not None
+                    and upper is not None
+                    and lower >= c.lower
+                    and upper <= c.upper
+                ),
+            )
+        )
+
+    coordinates = {p: int(dist[p]) for p in nodes}
+    return SolveResult(True, coordinates, [], 0, redundancy=items)
+
+
+def _spfa(
+    nodes: list[str],
+    adjacency: dict[str, list[Edge]],
+    source: str,
+    exclude_cid: str | None = None,
+) -> dict[str, int]:
+    """从 source 在差分图上求最短路（队列松弛 / SPFA）。
+
+    与 ``_bellman_ford`` 同为 Bellman–Ford 族松弛，只是只松弛上一轮真正
+    变短的节点，在可行（无负环）图上必然收敛且通常快得多。
+    ``exclude_cid`` 非空时跳过该编号约束的两条边（datum_pin 边 cid=None
+    永不被跳过），用于冗余判定的删边最短路。
+    """
+    dist: dict[str, int] = {p: INF for p in nodes}
+    dist[source] = 0
+    in_queue: dict[str, bool] = {p: False for p in nodes}
+    queue: deque[str] = deque([source])
+    in_queue[source] = True
+    while queue:
+        cur = queue.popleft()
+        in_queue[cur] = False
+        base = dist[cur]
+        for e in adjacency[cur]:
+            if exclude_cid is not None and e.cid == exclude_cid:
+                continue
+            nd = base + e.weight
+            if nd < dist[e.to]:
+                dist[e.to] = nd
+                if not in_queue[e.to]:
+                    in_queue[e.to] = True
+                    queue.append(e.to)
+    return dist
 
 
 def solve_reconcile(req: ReconcileRequest) -> SolveResult:

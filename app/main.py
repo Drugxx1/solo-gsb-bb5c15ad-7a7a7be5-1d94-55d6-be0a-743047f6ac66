@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from . import __version__
 from .schemas import (
     ChainRequest,
+    ConstraintRedundancy,
     CycleEdge,
     FeasibleResponse,
     InfeasibleResponse,
@@ -18,6 +19,7 @@ from .schemas import (
     RangesResponse,
     ReconcileRequest,
     ReconcileResponse,
+    RedundancyResponse,
     ValidationErrorResponse,
 )
 from .solver import (
@@ -27,6 +29,7 @@ from .solver import (
     solve,
     solve_ranges,
     solve_reconcile,
+    solve_redundancy,
 )
 
 logger = logging.getLogger("dimchain")
@@ -130,6 +133,31 @@ def ranges_chain(req: ChainRequest):
         for p, (lo, hi) in result.ranges.items()
     ]
     return RangesResponse(ranges=items)
+
+
+@app.post(
+    "/api/v1/chains/redundancy",
+    response_model=RedundancyResponse | InfeasibleResponse,
+    summary="识别被其余约束蕴含的冗余约束",
+    responses={422: {"model": ValidationErrorResponse}},
+    tags=["chains"],
+)
+def redundancy_chain(req: ChainRequest):
+    result = solve_redundancy(req)
+    if not result.feasible:
+        return _build_infeasible(result)
+
+    # 按请求约束顺序列出编号、推导界与冗余标记
+    items = [
+        ConstraintRedundancy(
+            id=it.cid,
+            derived_lower=it.lower,
+            derived_upper=it.upper,
+            redundant=it.redundant,
+        )
+        for it in result.redundancy or []
+    ]
+    return RedundancyResponse(constraints=items)
 
 
 @app.post(
