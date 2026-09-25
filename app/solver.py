@@ -51,6 +51,21 @@ anchor→p 的最短距离给出一组可行坐标，取到读数的最大偏差
 O(|V|) 次比较；e* 下的最短距离
 ``d*(v) = min(f(v), h(v) + e*)`` 即达到 e* 的同一组整数可行校正坐标
 （anchor 及与它 0 权互钉的基准点为 0）。
+
+冗余判定（``solve_redundancy``）
+---------------------------------
+逐条考察原始约束是否已被**其余约束 + 基准点钉零关系**蕴含。先对完整差分图
+做与 ``solve`` 相同的可行性判定（不可行时沿用同一矛盾闭环响应）；可行时
+对每条约束 c 临时移除其上限边与下限反向边，在剩余边构成的子图上分别自
+``c.start``、``c.end`` 跑 Bellman–Ford：
+
+* 推导上界 = 子图中 ``start→end`` 的最短距离（不可达 ⇒ 该侧无界，记 null）；
+* 推导下界 = 子图中 ``end→start`` 最短距离的相反数（不可达 ⇒ null）。
+
+子图是可行图的子图，必无负环，最短距离良定义；待判约束自身的两条边不参与
+推导。推导区间完整落入原约束区间（两侧均有界且 ``lower ≤ 推导下界`` 且
+``推导上界 ≤ upper``）时，该约束被其余条件蕴含，标记 ``redundant=True``；
+任一侧无界（null）必不冗余。
 """
 
 from __future__ import annotations
@@ -93,6 +108,21 @@ class SolveResult:
     ranges: dict[str, tuple[int, int]] | None = None
     # solve_reconcile 可行时：最小非负整数 e（逐点校正量绝对值的最大值）
     max_abs_correction: int | None = None
+    # solve_redundancy 可行时：按请求约束顺序的逐条冗余判定结果
+    redundancy: list["ConstraintRedundancy"] | None = None
+
+
+@dataclass(frozen=True)
+class ConstraintRedundancy:
+    """单条约束的冗余判定结果（待判约束自身不参与推导）。"""
+
+    cid: str
+    # 其余约束 + 基准点钉零关系对 end−start 推出的最紧下界；该侧无界为 None
+    derived_lower: int | None
+    # 其余约束 + 基准点钉零关系对 end−start 推出的最紧上界；该侧无界为 None
+    derived_upper: int | None
+    # 推导区间完整落入原约束 [lower, upper] 时为 True
+    redundant: bool
 
 
 def _err(code: str, message: str, location: list, constraint_id: str | None = None) -> dict:
@@ -265,15 +295,20 @@ def validate_readings(req: ReconcileRequest) -> None:
         raise ValidationError(errors)
 
 
-def _build_edges(req: ChainRequest, anchor: str) -> list[Edge]:
-    """构造差分图的全部边（顺序固定，保证结果确定性）。"""
+def _pin_edges(req: ChainRequest, anchor: str) -> list[Edge]:
+    """其余基准点与 anchor 互钉在同一零位（坐标同为 0）的 0 权边。"""
     edges: list[Edge] = []
-    # 其余基准点与 anchor 互相钉在同一坐标（同为 0）
     for d in req.datum_points:
         if d == anchor:
             continue
         edges.append(Edge(anchor, d, 0, None, "datum_pin", None, None))
         edges.append(Edge(d, anchor, 0, None, "datum_pin", None, None))
+    return edges
+
+
+def _build_edges(req: ChainRequest, anchor: str) -> list[Edge]:
+    """构造差分图的全部边（顺序固定，保证结果确定性）。"""
+    edges = _pin_edges(req, anchor)
     for c in req.constraints:
         edges.extend(_constraint_edges(c))
     return edges
@@ -388,6 +423,72 @@ def solve_ranges(req: ChainRequest) -> SolveResult:
         # -lower_dist[p] ≤ x_p ≤ upper_dist[p]
         ranges[p] = (-int(lower_dist[p]), int(upper_dist[p]))
     return SolveResult(True, coordinates, [], 0, ranges)
+
+
+def solve_redundancy(req: ChainRequest) -> SolveResult:
+    """逐条判定原始约束是否被其余约束与基准点钉零关系蕴含。
+
+    先按与 solve 完全相同的流程做静态校验与可行性判定：原约束系统有负环时
+    返回同一矛盾闭环。可行时按请求约束顺序，对每条约束 c 移除其上下界两条
+    边，在其余边（含 datum_pin 边）构成的子图上推导 ``x_end − x_start`` 的
+    最紧区间：
+
+    * 自 c.start 跑 Bellman–Ford：start→end 最短距离即推导上界，不可达
+      （距离仍为 INF）表示其余条件对该侧无界，记 None；
+    * 自 c.end 跑 Bellman–Ford：end→start 最短距离取负即推导下界，不可达
+      同样记 None。
+
+    只有两侧都有界且推导区间完整落入原约束区间
+    ``[c.lower, c.upper]`` 时标记 redundant=True。子图是可行图的子图，
+    不可能出现负环；待判约束自身的两条边均不计入推导。
+    """
+    validate_request(req)
+
+    anchor = req.datum_points[0]
+    nodes = list(dict.fromkeys([*req.datum_points, *req.measure_points]))
+    edges = _build_edges(req, anchor)
+
+    dist, pred, bad_edge = _bellman_ford(nodes, edges, anchor)
+    if bad_edge is not None:
+        cycle = _extract_cycle(pred, bad_edge, len(nodes))
+        return SolveResult(False, {}, cycle, sum(e.weight for e in cycle))
+
+    pin_edges = _pin_edges(req, anchor)
+    edge_pairs = [_constraint_edges(c) for c in req.constraints]
+
+    redundancy: list[ConstraintRedundancy] = []
+    for i, c in enumerate(req.constraints):
+        # 仅排除第 i 条约束自身的上下界两条边；其余约束与基准钉零关系全保留
+        rest: list[Edge] = list(pin_edges)
+        rest.extend(e for j, pair in enumerate(edge_pairs) if j != i for e in pair)
+
+        # start→end 最短路 ⇒ x_end − x_start 的最紧上界
+        upper_dist, _, upper_bad = _bellman_ford(nodes, rest, c.start)
+        if upper_bad is not None:  # pragma: no cover - 可行图的子图必无负环
+            raise RuntimeError("移除约束后的子图检测到负环，与可行性结论矛盾")
+        # end→start 最短路取负 ⇒ x_end − x_start 的最紧下界
+        lower_dist, _, lower_bad = _bellman_ford(nodes, rest, c.end)
+        if lower_bad is not None:  # pragma: no cover - 可行图的子图必无负环
+            raise RuntimeError("移除约束后的子图检测到负环，与可行性结论矛盾")
+
+        derived_upper = (
+            int(upper_dist[c.end]) if upper_dist[c.end] != INF else None
+        )
+        derived_lower = (
+            -int(lower_dist[c.start]) if lower_dist[c.start] != INF else None
+        )
+        redundant = (
+            derived_lower is not None
+            and derived_upper is not None
+            and c.lower <= derived_lower
+            and derived_upper <= c.upper
+        )
+        redundancy.append(
+            ConstraintRedundancy(c.id, derived_lower, derived_upper, redundant)
+        )
+
+    coordinates = {p: int(dist[p]) for p in nodes}
+    return SolveResult(True, coordinates, [], 0, None, None, redundancy)
 
 
 def solve_reconcile(req: ReconcileRequest) -> SolveResult:

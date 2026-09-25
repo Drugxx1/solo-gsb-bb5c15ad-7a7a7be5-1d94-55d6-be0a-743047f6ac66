@@ -159,6 +159,48 @@ class RangesResponse(BaseModel):
     )
 
 
+class ConstraintRedundancyItem(BaseModel):
+    """单条原始尺寸约束的冗余判定明细。
+
+    推导界由“其余约束 + 全部基准点钉零为 0 的关系”（不含该约束自身的
+    上下界两条边）对 ``coord(end) − coord(start)`` 推出；无界一侧为 null。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    constraint_id: PointId = Field(..., description="被判定约束的原始编号")
+    derived_lower: StrictInt | None = Field(
+        ...,
+        description=(
+            "其余条件对 end−start 推出的最紧下界（整数微米，含端点）；"
+            "其余条件对该侧无界（end 在差分图中不可达 start）时为 null"
+        ),
+    )
+    derived_upper: StrictInt | None = Field(
+        ...,
+        description=(
+            "其余条件对 end−start 推出的最紧上界（整数微米，含端点）；"
+            "其余条件对该侧无界（end 在差分图中从 start 不可达）时为 null"
+        ),
+    )
+    redundant: bool = Field(
+        ...,
+        description=(
+            "仅当推导区间 [derived_lower, derived_upper] 完整落在原约束区间 "
+            "[lower, upper] 内（两侧均有界且 lower ≤ derived_lower、"
+            "derived_upper ≤ upper）时为 true"
+        ),
+    )
+
+
+class RedundancyResponse(BaseModel):
+    status: Literal["feasible"] = "feasible"
+    unit: Literal["um"] = "um"
+    results: list[ConstraintRedundancyItem] = Field(
+        ..., description="逐条约束的冗余判定结果，按请求 constraints 的顺序列出"
+    )
+
+
 class PointCorrection(BaseModel):
     """单个测点的读数校正明细。"""
 

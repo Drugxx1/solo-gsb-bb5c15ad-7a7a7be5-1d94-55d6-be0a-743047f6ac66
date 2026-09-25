@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from . import __version__
 from .schemas import (
     ChainRequest,
+    ConstraintRedundancyItem,
     CycleEdge,
     FeasibleResponse,
     InfeasibleResponse,
@@ -18,6 +19,7 @@ from .schemas import (
     RangesResponse,
     ReconcileRequest,
     ReconcileResponse,
+    RedundancyResponse,
     ValidationErrorResponse,
 )
 from .solver import (
@@ -27,6 +29,7 @@ from .solver import (
     solve,
     solve_ranges,
     solve_reconcile,
+    solve_redundancy,
 )
 
 logger = logging.getLogger("dimchain")
@@ -159,6 +162,31 @@ def reconcile_chain(req: ReconcileRequest):
         coordinates=result.coordinates,
         corrections=corrections,
     )
+
+
+@app.post(
+    "/api/v1/chains/redundancy",
+    response_model=RedundancyResponse | InfeasibleResponse,
+    summary="判定各约束是否已被其余条件蕴含（冗余）",
+    responses={422: {"model": ValidationErrorResponse}},
+    tags=["chains"],
+)
+def redundancy_chain(req: ChainRequest):
+    result = solve_redundancy(req)
+    if not result.feasible:
+        return _build_infeasible(result)
+
+    # 逐条约束的推导界与冗余标记，按请求 constraints 顺序列出
+    items = [
+        ConstraintRedundancyItem(
+            constraint_id=r.cid,
+            derived_lower=r.derived_lower,
+            derived_upper=r.derived_upper,
+            redundant=r.redundant,
+        )
+        for r in result.redundancy  # type: ignore[union-attr]
+    ]
+    return RedundancyResponse(results=items)
 
 
 @app.get("/healthz", tags=["meta"], summary="健康检查")

@@ -10,6 +10,8 @@
   `/ranges` 进一步返回每个测点在全部约束同时成立时可分别达到的**最小/最大整数坐标紧界**；
   `/reconcile` 在提交各测点实测**读数**后，求让全部测点同时满足
   `|校正坐标 − 读数| ≤ e` 的**最小非负整数 e**，并返回达到该 e 的同一组校正坐标与逐点校正量；
+  `/redundancy` 逐条判定每条原始尺寸约束是否已被**其余约束与基准点钉零关系蕴含**，
+  返回由其余条件对 `end−start` 推出的最紧区间（无界一侧为 `null`）及冗余标记；
 - **有负环（不可行）**：沿负环累加得到 `0 ≤ 负数` 的矛盾，返回构成该矛盾
   闭环的**原始约束编号**及逐边明细，便于定位尺寸链中的过约束环节。
 
@@ -29,6 +31,7 @@ docker compose up --build -d
 | 可行性校核接口 | `POST http://localhost:8000/api/v1/chains/check` |
 | 测点坐标紧界接口 | `POST http://localhost:8000/api/v1/chains/ranges` |
 | 读数最小校正接口 | `POST http://localhost:8000/api/v1/chains/reconcile` |
+| 约束冗余判定接口 | `POST http://localhost:8000/api/v1/chains/redundancy` |
 | Swagger UI（在线试调） | <http://localhost:8000/docs> |
 | OpenAPI Schema | <http://localhost:8000/openapi.json> |
 
@@ -71,6 +74,11 @@ curl -s -X POST http://localhost:8000/api/v1/chains/reconcile \
   -H 'Content-Type: application/json' \
   -d @examples/reconcile.json | python -m json.tool
 
+# 可行：逐条判定约束是否被其余约束与基准钉零关系蕴含（c3 被 c1+c2 推出）
+curl -s -X POST http://localhost:8000/api/v1/chains/redundancy \
+  -H 'Content-Type: application/json' \
+  -d @examples/redundancy.json | python -m json.tool
+
 # 不可行：返回矛盾闭环的约束编号
 curl -s -X POST http://localhost:8000/api/v1/chains/check \
   -H 'Content-Type: application/json' \
@@ -84,11 +92,12 @@ curl -s -X POST http://localhost:8000/api/v1/chains/check \
 
 ## 请求与响应
 
-`/api/v1/chains/check` 与 `/api/v1/chains/ranges` 的请求体、静态校验规则
-（含下文 422 错误码）完全一致；`/reconcile` 在其基础上**额外要求** `readings`
-字段，其余字段与校验规则沿用。
+`/api/v1/chains/check`、`/api/v1/chains/ranges` 与
+`/api/v1/chains/redundancy` 的请求体、静态校验规则（含下文 422 错误码）
+完全一致；`/reconcile` 在其基础上**额外要求** `readings` 字段，其余字段与
+校验规则沿用。
 
-### 请求体 `POST /api/v1/chains/check`（`/ranges` 同）
+### 请求体 `POST /api/v1/chains/check`（`/ranges`、`/redundancy` 同）
 
 ```json
 {
@@ -232,6 +241,68 @@ c1/c2 则 B、C 各为 `[0,10]`，但 c3 要求 `C − B = 5`，跨测点约束�
 `max_abs_correction` 即所有逐点校正量绝对值的最大值；至少有一个测点的校正量
 绝对值等于它（否则 `e−1` 即可行，与最小性矛盾）。
 
+### `POST /api/v1/chains/redundancy`：约束冗余判定
+
+请求体与 `/check` **完全相同**（同样的字段、同样的静态校验与 422 响应）。
+服务端先做可行性校核：**原约束本身无解时**（负环），返回与 `/check`
+**完全相同的 `InfeasibleResponse`**（矛盾闭环编号、逐边明细、环权）。
+
+可行时，按请求 `constraints` 的顺序**逐条**把该约束的上下界两条边从差分图
+中移除，仅用**其余约束 + 全部基准点钉零为 0 的关系**（不含待判约束自身），
+对 `coord(end) − coord(start)` 推导最紧区间：
+
+- `derived_upper` = 移除后差分图中 `start → end` 的最短距离；`end` 从
+  `start` 不可达表示其余条件对该侧**无界**，返回 `null`；
+- `derived_lower` = `end → start` 最短距离的相反数；不可达同样为 `null`。
+
+只有推导区间 `[derived_lower, derived_upper]` **完整落入**原约束区间
+`[lower, upper]`（两侧均有界且 `lower ≤ derived_lower`、
+`derived_upper ≤ upper`，端点重合也算）时，该约束被其余条件蕴含，
+`redundant` 标记为 `true`；任一侧无界（`null`）时恒为 `false`。
+
+请求（`examples/redundancy.json`）：
+
+```json
+{
+  "datum_points": ["A"],
+  "measure_points": ["B", "C", "D"],
+  "constraints": [
+    {"id": "c1", "start": "A", "end": "B", "lower": 10, "upper": 12},
+    {"id": "c2", "start": "B", "end": "C", "lower": 5, "upper": 8},
+    {"id": "c3", "start": "A", "end": "C", "lower": 14, "upper": 21},
+    {"id": "c4", "start": "C", "end": "D", "lower": 0, "upper": 3}
+  ]
+}
+```
+
+响应（HTTP 200）：
+
+```json
+{
+  "status": "feasible",
+  "unit": "um",
+  "results": [
+    {"constraint_id": "c1", "derived_lower": 6,  "derived_upper": 16, "redundant": false},
+    {"constraint_id": "c2", "derived_lower": 2,  "derived_upper": 11, "redundant": false},
+    {"constraint_id": "c3", "derived_lower": 15, "derived_upper": 20, "redundant": true},
+    {"constraint_id": "c4", "derived_lower": null, "derived_upper": null, "redundant": false}
+  ]
+}
+```
+
+上例：c1/c2 联合推出 `C − A ∈ [15,20]`，完整落在 c3 的 `[14,21]` 内，故
+**c3 冗余**（删掉它不改变可行域）；单独移除 c1 后，c2 与 c3 只能推出
+`B − A ∈ [6,16]`，比 c1 的 `[10,12]` 更宽，故 c1 不冗余；c4 是 D 连入
+尺寸链的唯一约束，移除后 D 与其余点互不可达，推导界两侧均为 `null`，
+不冗余。`results` 严格按请求 `constraints` 的顺序排列。
+
+| 字段 | 说明 |
+| --- | --- |
+| `results[].constraint_id` | 被判定约束的原始编号，按请求顺序列出 |
+| `results[].derived_lower` | 其余条件对 `end−start` 推出的最紧下界（整数微米，含端点）；无下界为 `null` |
+| `results[].derived_upper` | 其余条件对 `end−start` 推出的最紧上界（整数微米，含端点）；无上界为 `null` |
+| `results[].redundant` | 推导区间完整落入原约束 `[lower, upper]` 时为 `true`，否则为 `false` |
+
 ### 响应二：不可行（HTTP 200）
 
 ```json
@@ -326,6 +397,17 @@ Bellman–Ford）。预计算这三个量（三次 O(|V|·|E|) 松弛，与 `/ra
 后，二分中每次可行性判定只需 O(|V|) 比较；`e*` 下的最短距离
 `min(f(v), h(v) + e*)` 即为达到 e* 的同一组整数校正坐标，逐点校正量为
 `校正坐标 − 读数`。
+
+`/redundancy` 复用同一张差分图与 Bellman–Ford 松弛：先对完整图做一次
+可行性判定（负环即沿用同一闭环响应）；可行时对每条约束 c 移除其
+`start → end`（权 `upper`）与 `end → start`（权 `−lower`）两条边，在
+剩余边（含基准点 0 权 pin 边）构成的子图上分别自 `c.start`、`c.end`
+各跑一次 Bellman–Ford。差分不等式 `x_v − x_u ≤ w(u→v)` 保证
+`x_end − x_start` 不超过任意 `start→end` 路径权和，故最紧上界即该路径
+最短距离；最紧下界为 `end→start` 最短距离取负。源点不可达一侧（距离
+保持 +∞）表示其余条件对该侧无界，输出 `null`。被判定约束自身的两条边
+不参与推导；子图是可行图的子图，不可能出现负环。每条约束两次最短路，
+整体复杂度 O(|C|·|V|·|E|)。
 
 ## 项目结构
 
